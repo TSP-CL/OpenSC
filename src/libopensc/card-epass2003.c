@@ -264,14 +264,50 @@ epass2003_check_sw(struct sc_card *card, unsigned int sw1, unsigned int sw2)
 	return SC_ERROR_CARD_CMD_FAILED;
 }
 
+/*
+ * The secure messaging session belongs to the process that established it. When
+ * another process uses the token in between, the session keys of this process no
+ * longer match the card's. On Windows this happens on every signature: the PIN
+ * dialog (CredentialUIBroker.exe) verifies the PIN with its own minidriver
+ * instance and, on CardDeauthenticate, epass2003_logout() re-establishes secure
+ * messaging, so the application's next APDU fails.
+ *
+ * The card then answers 6985/6988, or with a response whose MAC cannot be
+ * verified (SC_ERROR_CARD_CMD_FAILED from epass2003_sm_unwrap_apdu()). In both
+ * cases secure messaging is re-established and the APDU is sent once more.
+ *
+ * EXTERNAL AUTHENTICATE (PIN verification) is not repeated after an unverifiable
+ * response: its cryptogram was computed from the previous challenge and, if the
+ * card evaluated it, repeating it could consume a PIN attempt.
+ */
+#define EPASS2003_INS_EXTERNAL_AUTHENTICATE 0x82
+
+static int
+epass2003_sm_session_lost(sc_card_t *card, const sc_apdu_t *apdu, int r)
+{
+	epass2003_exdata *exdata = (epass2003_exdata *)card->drv_data;
+
+	/* Not while secure messaging is being (re-)established: no recursion */
+	if (!exdata || card->sm_ctx.sm_mode != SM_MODE_TRANSMIT)
+		return 0;
+
+	if (0x69 == apdu->sw1 && (0x85 == apdu->sw2 || 0x88 == apdu->sw2))
+		return 1;
+
+	return r == SC_ERROR_CARD_CMD_FAILED && exdata->sm != SM_PLAIN &&
+		apdu->ins != EPASS2003_INS_EXTERNAL_AUTHENTICATE;
+}
+
 static int
 sc_transmit_apdu_t(sc_card_t *card, sc_apdu_t *apdu)
 {
 	size_t resplen = apdu->resplen;
 	int r = sc_transmit_apdu(card, apdu);
-	if ( ((0x69 == apdu->sw1) && (0x85 == apdu->sw2)) || ((0x69 == apdu->sw1) && (0x88 == apdu->sw2)))
+	if (epass2003_sm_session_lost(card, apdu, r))
 	{
-		epass2003_refresh(card);
+		sc_log(card->ctx, "Secure messaging session lost, re-establishing it");
+		r = epass2003_refresh(card);
+		LOG_TEST_RET(card->ctx, r, "Re-establishing secure messaging failed");
 		/* renew old resplen */
 		apdu->resplen = resplen;
 		r = sc_transmit_apdu(card, apdu);
@@ -3293,20 +3329,27 @@ get_external_key_retries(struct sc_card *card, unsigned char kid, unsigned char 
 static int
 epass2003_get_challenge(sc_card_t *card, u8 *rnd, size_t len)
 {
+	struct sc_apdu apdu;
 	u8 rbuf[16];
 	size_t out_len;
 	int r;
 
 	LOG_FUNC_CALLED(card->ctx);
 
-	r = iso_ops->get_challenge(card, rbuf, sizeof rbuf);
+	/* Same APDU as iso7816_get_challenge(), but sent through sc_transmit_apdu_t():
+	 * GET CHALLENGE is the first command of a PIN verification, so it is where a
+	 * secure messaging session re-established by another process shows up. */
+	sc_format_apdu(card, &apdu, SC_APDU_CASE_2, 0x84, 0x00, 0x00);
+	apdu.le = sizeof rbuf;
+	apdu.resp = rbuf;
+	apdu.resplen = sizeof rbuf;
+
+	r = sc_transmit_apdu_t(card, &apdu);
+	LOG_TEST_RET(card->ctx, r, "APDU transmit failed");
+	r = sc_check_sw(card, apdu.sw1, apdu.sw2);
 	LOG_TEST_RET(card->ctx, r, "GET CHALLENGE cmd failed");
 
-	if (len < (size_t) r) {
-		out_len = len;
-	} else {
-		out_len = (size_t) r;
-	}
+	out_len = len < apdu.resplen ? len : apdu.resplen;
 	memcpy(rnd, rbuf, out_len);
 
 	LOG_FUNC_RETURN(card->ctx, (int) out_len);
