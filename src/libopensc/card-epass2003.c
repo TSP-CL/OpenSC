@@ -297,9 +297,11 @@ epass2003_sm_session_lost(sc_card_t *card, const sc_apdu_t *apdu, int r)
 	if (0x69 == apdu->sw1 && (0x85 == apdu->sw2 || 0x88 == apdu->sw2))
 		return 1;
 
-	/* An unverifiable response only exists for APDUs sent with secure messaging */
+	/* An unverifiable response only exists for APDUs sent with secure messaging.
+	 * sm_mode cannot be checked here either: sc_sm_single_transmit() already
+	 * called sc_sm_stop() (sm_mode = SM_MODE_NONE) when unwrapping failed;
+	 * epass2003_refresh() turns it back on. */
 	return r == SC_ERROR_CARD_CMD_FAILED && exdata->sm != SM_PLAIN &&
-		card->sm_ctx.sm_mode == SM_MODE_TRANSMIT &&
 		apdu->ins != EPASS2003_INS_EXTERNAL_AUTHENTICATE;
 }
 
