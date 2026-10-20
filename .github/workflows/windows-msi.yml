@@ -43,7 +43,12 @@ jobs:
           ls -l win32/winconfig.h win32/OpenSC.wxs
 
       - name: OpenSSL (static, vcpkg)
-        run: C:\vcpkg\vcpkg install openssl:x64-windows-static
+        run: |
+          C:\vcpkg\vcpkg install openssl:x64-windows-static
+          # Make.rules.mak (0.25.1) links the Shining Light layout and recursive nmake calls
+          # do not inherit OPENSSL_LIB, so expose vcpkg's static libcrypto under that name
+          New-Item -ItemType Directory -Force "$env:SSL\lib\VC\static" | Out-Null
+          Copy-Item "$env:SSL\lib\libcrypto.lib" "$env:SSL\lib\VC\static\libcrypto64MT.lib"
 
       - name: Cryptographic Provider Development Kit
         run: choco install windows-cryptographic-provider-development-kit -y --no-progress
@@ -66,7 +71,7 @@ jobs:
           call "%VSPATH%\VC\Auxiliary\Build\vcvarsall.bat" x64 || exit /b 1
           rem Newer MSVC warnings must not break a build tuned for VS2015/2017 (/WX in Make.rules.mak)
           set _CL_=/WX-
-          set NMAKE_EXTRA=OPENSSL_DEF=/DENABLE_OPENSSL OPENSSL_DIR=%SSL% "OPENSSL_LIB=%SSL%\lib\libcrypto.lib user32.lib advapi32.lib crypt32.lib ws2_32.lib" OPENSSL_EXTRA_CFLAGS=/DOPENSSL_SECURE_MALLOC_SIZE=65536 WIXVSVER=VS2017
+          set NMAKE_EXTRA=OPENSSL_DEF=/DENABLE_OPENSSL OPENSSL_DIR=%SSL% OPENSSL_EXTRA_CFLAGS=/DOPENSSL_SECURE_MALLOC_SIZE=65536 WIXVSVER=VS2017
           nmake /nologo /f Makefile.mak %NMAKE_EXTRA% || exit /b 1
           cd win32 && nmake /nologo /f Makefile.mak %NMAKE_EXTRA% OpenSC.msi || exit /b 1
           cd .. && move win32\OpenSC.msi OpenSC-0.25.1-firmadigital_win64.msi
