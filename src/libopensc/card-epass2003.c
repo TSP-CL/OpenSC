@@ -112,6 +112,7 @@ typedef struct epass2003_exdata_st {
 	unsigned char bFipsCertification;	/* fips mode Alg */
 	unsigned char currAlg;		/* current Alg */
 	unsigned int  ecAlgFlags; 	/* Ec Alg mechanism type*/
+	unsigned char in_mutual_auth;	/* secure messaging is being (re-)established */
 } epass2003_exdata;
 
 #define REVERSE_ORDER4(x)	(			  \
@@ -287,14 +288,18 @@ epass2003_sm_session_lost(sc_card_t *card, const sc_apdu_t *apdu, int r)
 {
 	epass2003_exdata *exdata = (epass2003_exdata *)card->drv_data;
 
-	/* Not while secure messaging is being (re-)established: no recursion */
-	if (!exdata || card->sm_ctx.sm_mode != SM_MODE_TRANSMIT)
+	/* Not while secure messaging is being (re-)established: no recursion.
+	 * Some APDUs (SELECT FILE) are sent in plain mode, so sm_mode cannot be used
+	 * for this: their 6985/6988 must still trigger the recovery. */
+	if (!exdata || exdata->in_mutual_auth)
 		return 0;
 
 	if (0x69 == apdu->sw1 && (0x85 == apdu->sw2 || 0x88 == apdu->sw2))
 		return 1;
 
+	/* An unverifiable response only exists for APDUs sent with secure messaging */
 	return r == SC_ERROR_CARD_CMD_FAILED && exdata->sm != SM_PLAIN &&
+		card->sm_ctx.sm_mode == SM_MODE_TRANSMIT &&
 		apdu->ins != EPASS2003_INS_EXTERNAL_AUTHENTICATE;
 }
 
@@ -932,17 +937,23 @@ mutual_auth(struct sc_card *card, unsigned char *key_enc,
 
 	LOG_FUNC_CALLED(ctx);
 
+	/* sc_transmit_apdu_t() must not re-establish secure messaging from here */
+	exdata->in_mutual_auth = 1;
+
 	r = gen_init_key(card, key_enc, key_mac, result, exdata->smtype);
-	LOG_TEST_RET(ctx, r, "gen_init_key failed");
-	if(exdata->bFipsCertification){
-		memcpy(ran_key, &result[12+1], 8);
-	}
-	else{
-		memcpy(ran_key, &result[12], 8);
+	if (r == SC_SUCCESS) {
+		if(exdata->bFipsCertification){
+			memcpy(ran_key, &result[12+1], 8);
+		}
+		else{
+			memcpy(ran_key, &result[12], 8);
+		}
+
+		r = verify_init_key(card, ran_key, exdata->smtype);
 	}
 
-	r = verify_init_key(card, ran_key, exdata->smtype);
-	LOG_TEST_RET(ctx, r, "verify_init_key failed");
+	exdata->in_mutual_auth = 0;
+	LOG_TEST_RET(ctx, r, "mutual authentication failed");
 
 	LOG_FUNC_RETURN(ctx, r);
 }
