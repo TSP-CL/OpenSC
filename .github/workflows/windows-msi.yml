@@ -1,0 +1,86 @@
+# Windows x64 MSI for the 0.25.1-based branches of this fork.
+# Mirrors the 0.25.1 AppVeyor build (.appveyor.yml), adapted to GitHub-hosted runners:
+# configure runs under MSYS2/MinGW64 only to generate the win32 sources
+# (winconfig.h, OpenSC.wxs, version resources); the build itself is nmake + MSVC.
+name: Windows MSI
+
+on:
+  push:
+    branches: [ 'fix/**' ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  msi:
+    runs-on: windows-2022
+    env:
+      SSL: C:\vcpkg\installed\x64-windows-static
+    steps:
+      - name: Keep LF line endings (autotools scripts)
+        run: git config --global core.autocrlf false
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up MSYS2 (MinGW64)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: >-
+            autoconf automake libtool make pkgconf git
+            mingw-w64-x86_64-gcc
+
+      - name: Generate win32 sources (bootstrap + configure)
+        shell: msys2 {0}
+        run: |
+          ./bootstrap
+          ./configure --disable-openssl --disable-readline --disable-zlib --disable-openpace || { cat config.log; exit 1; }
+          ls -l win32/winconfig.h win32/OpenSC.wxs
+
+      - name: OpenSSL (static, vcpkg)
+        run: C:\vcpkg\vcpkg install openssl:x64-windows-static
+
+      - name: Cryptographic Provider Development Kit
+        run: choco install windows-cryptographic-provider-development-kit -y --no-progress
+
+      - name: WiX Toolset 3
+        run: |
+          $wix = Get-ChildItem "${env:ProgramFiles(x86)}\WiX Toolset v3*" -Directory -ErrorAction SilentlyContinue | Sort-Object Name | Select-Object -Last 1
+          if (-not $wix) {
+            choco install wixtoolset -y --no-progress
+            $wix = Get-ChildItem "${env:ProgramFiles(x86)}\WiX Toolset v3*" -Directory | Sort-Object Name | Select-Object -Last 1
+          }
+          Write-Output "WiX: $($wix.FullName)"
+          Get-ChildItem "$($wix.FullName)\SDK" -Directory | ForEach-Object { $_.Name }
+          "WIX=$($wix.FullName)\" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - name: Build OpenSC and the MSI
+        shell: cmd
+        run: |
+          for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath`) do set VSPATH=%%i
+          call "%VSPATH%\VC\Auxiliary\Build\vcvarsall.bat" x64 || exit /b 1
+          rem Newer MSVC warnings must not break a build tuned for VS2015/2017 (/WX in Make.rules.mak)
+          set _CL_=/WX-
+          set NMAKE_EXTRA=OPENSSL_DEF=/DENABLE_OPENSSL OPENSSL_DIR=%SSL% "OPENSSL_LIB=%SSL%\lib\libcrypto.lib user32.lib advapi32.lib crypt32.lib ws2_32.lib" OPENSSL_EXTRA_CFLAGS=/DOPENSSL_SECURE_MALLOC_SIZE=65536 WIXVSVER=VS2017
+          nmake /nologo /f Makefile.mak %NMAKE_EXTRA% || exit /b 1
+          cd win32 && nmake /nologo /f Makefile.mak %NMAKE_EXTRA% OpenSC.msi || exit /b 1
+          cd .. && move win32\OpenSC.msi OpenSC-0.25.1-firmadigital_win64.msi
+
+      - name: Upload MSI
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenSC-0.25.1-firmadigital_win64
+          path: OpenSC-0.25.1-firmadigital_win64.msi
+
+      - name: Upload debug symbols
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenSC-0.25.1-firmadigital_win64-pdb
+          path: |
+            src/**/*.pdb
+            !src/**/vc*.pdb
