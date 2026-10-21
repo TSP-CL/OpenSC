@@ -273,18 +273,18 @@ epass2003_check_sw(struct sc_card *card, unsigned int sw1, unsigned int sw2)
  * instance and, on CardDeauthenticate, epass2003_logout() re-establishes secure
  * messaging, so the application's next APDU fails.
  *
- * The card then answers 6985/6988, or with a response whose MAC cannot be
- * verified (SC_ERROR_CARD_CMD_FAILED from epass2003_sm_unwrap_apdu()). In both
- * cases secure messaging is re-established and the APDU is sent once more.
+ * The card then answers 6985, 6987 or 6988 (the latter two in plain, see
+ * epass2003_sm_unwrap_apdu()): secure messaging is re-established and the APDU
+ * is sent once more.
  *
- * EXTERNAL AUTHENTICATE (PIN verification) is not repeated after an unverifiable
- * response: its cryptogram was computed from the previous challenge and, if the
- * card evaluated it, repeating it could consume a PIN attempt.
+ * EXTERNAL AUTHENTICATE (PIN verification) is never repeated: its cryptogram
+ * was computed from the previous challenge, which the new session invalidates,
+ * and a repeated attempt could consume a PIN try.
  */
 #define EPASS2003_INS_EXTERNAL_AUTHENTICATE 0x82
 
 static int
-epass2003_sm_session_lost(sc_card_t *card, const sc_apdu_t *apdu, int r)
+epass2003_sm_session_lost(sc_card_t *card, const sc_apdu_t *apdu)
 {
 	epass2003_exdata *exdata = (epass2003_exdata *)card->drv_data;
 
@@ -294,15 +294,11 @@ epass2003_sm_session_lost(sc_card_t *card, const sc_apdu_t *apdu, int r)
 	if (!exdata || exdata->in_mutual_auth)
 		return 0;
 
-	if (0x69 == apdu->sw1 && (0x85 == apdu->sw2 || 0x88 == apdu->sw2))
-		return 1;
+	if (apdu->ins == EPASS2003_INS_EXTERNAL_AUTHENTICATE)
+		return 0;
 
-	/* An unverifiable response only exists for APDUs sent with secure messaging.
-	 * sm_mode cannot be checked here either: sc_sm_single_transmit() already
-	 * called sc_sm_stop() (sm_mode = SM_MODE_NONE) when unwrapping failed;
-	 * epass2003_refresh() turns it back on. */
-	return r == SC_ERROR_CARD_CMD_FAILED && exdata->sm != SM_PLAIN &&
-		apdu->ins != EPASS2003_INS_EXTERNAL_AUTHENTICATE;
+	return 0x69 == apdu->sw1 &&
+		(0x85 == apdu->sw2 || 0x87 == apdu->sw2 || 0x88 == apdu->sw2);
 }
 
 static int
@@ -310,7 +306,7 @@ sc_transmit_apdu_t(sc_card_t *card, sc_apdu_t *apdu)
 {
 	size_t resplen = apdu->resplen;
 	int r = sc_transmit_apdu(card, apdu);
-	if (epass2003_sm_session_lost(card, apdu, r))
+	if (r == SC_SUCCESS && epass2003_sm_session_lost(card, apdu))
 	{
 		sc_log(card->ctx, "Secure messaging session lost, re-establishing it");
 		r = epass2003_refresh(card);
@@ -1567,6 +1563,20 @@ epass2003_sm_unwrap_apdu(struct sc_card *card, struct sc_apdu *sm, struct sc_apd
 	exdata = (epass2003_exdata *)card->drv_data;
 
 	LOG_FUNC_CALLED(card->ctx);
+
+	/* When the card cannot verify the secure messaging of a command (e.g. the
+	 * session keys were renewed by another process), it answers 6987/6988 in
+	 * plain, without data or MAC. Pass these status words through, so that
+	 * sc_transmit_apdu_t() can re-establish secure messaging, instead of
+	 * reporting them as a MAC failure. */
+	if (exdata->sm && sm->resplen == 0 && sm->sw1 == 0x69 &&
+			(sm->sw2 == 0x87 || sm->sw2 == 0x88)) {
+		sc_log(card->ctx, "Card could not verify secure messaging: SW %02X%02X", sm->sw1, sm->sw2);
+		plain->resplen = 0;
+		plain->sw1 = sm->sw1;
+		plain->sw2 = sm->sw2;
+		LOG_FUNC_RETURN(card->ctx, SC_SUCCESS);
+	}
 
 	/* verify MAC, and check if SW1,2 match SW1,2 encapsulated in SM */
 	if (exdata->sm) {
