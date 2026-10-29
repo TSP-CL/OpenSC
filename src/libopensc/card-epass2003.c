@@ -112,6 +112,7 @@ typedef struct epass2003_exdata_st {
 	unsigned char bFipsCertification;	/* fips mode Alg */
 	unsigned char currAlg;		/* current Alg */
 	unsigned int  ecAlgFlags; 	/* Ec Alg mechanism type*/
+	unsigned char in_mutual_auth;	/* secure messaging is being (re-)established */
 } epass2003_exdata;
 
 #define REVERSE_ORDER4(x)	(			  \
@@ -263,13 +264,50 @@ epass2003_check_sw(struct sc_card *card, unsigned int sw1, unsigned int sw2)
 	return SC_ERROR_CARD_CMD_FAILED;
 }
 
+/*
+ * The secure messaging session belongs to the process that established it. When
+ * another process opens the token or logs out (epass2003_init() and
+ * epass2003_logout() run mutual authentication), the session keys of this
+ * process no longer match the card's. On Windows this happens on every
+ * signature through the minidriver: the PIN dialog (CredentialUIBroker.exe)
+ * verifies the PIN with its own minidriver instance and re-establishes secure
+ * messaging on CardDeauthenticate.
+ *
+ * The card then answers 6987/6988 in plain (passed through by
+ * epass2003_sm_unwrap_apdu()) or 6985: secure messaging is re-established and
+ * the APDU is sent once more.
+ *
+ * EXTERNAL AUTHENTICATE (PIN verification) is never repeated: its cryptogram
+ * was computed from the previous challenge, which the new session invalidates,
+ * and a repeated attempt could consume a PIN try.
+ */
+#define EPASS2003_INS_EXTERNAL_AUTHENTICATE 0x82
+
+static int
+epass2003_sm_session_lost(sc_card_t *card, const sc_apdu_t *apdu)
+{
+	epass2003_exdata *exdata = (epass2003_exdata *)card->drv_data;
+
+	/* No recursion while secure messaging is being (re-)established. Some APDUs
+	 * (SELECT FILE) are sent in plain mode, so sm_mode cannot be used here. */
+	if (!exdata || exdata->in_mutual_auth)
+		return 0;
+
+	if (apdu->ins == EPASS2003_INS_EXTERNAL_AUTHENTICATE)
+		return 0;
+
+	return 0x69 == apdu->sw1 && (0x85 == apdu->sw2 || 0x87 == apdu->sw2 || 0x88 == apdu->sw2);
+}
+
 static int
 sc_transmit_apdu_t(sc_card_t *card, sc_apdu_t *apdu)
 {
 	size_t resplen = apdu->resplen;
 	int r = sc_transmit_apdu(card, apdu);
-	if ((0x69 == apdu->sw1 && 0x85 == apdu->sw2) || (0x69 == apdu->sw1 && 0x88 == apdu->sw2)) {
-		epass2003_refresh(card);
+	if (r == SC_SUCCESS && epass2003_sm_session_lost(card, apdu)) {
+		sc_log(card->ctx, "Secure messaging session lost, re-establishing it");
+		r = epass2003_refresh(card);
+		LOG_TEST_RET(card->ctx, r, "Re-establishing secure messaging failed");
 		/* renew old resplen */
 		apdu->resplen = resplen;
 		r = sc_transmit_apdu(card, apdu);
@@ -906,16 +944,22 @@ mutual_auth(struct sc_card *card, unsigned char *key_enc,
 
 	LOG_FUNC_CALLED(ctx);
 
+	/* sc_transmit_apdu_t() must not re-establish secure messaging from here */
+	exdata->in_mutual_auth = 1;
+
 	r = gen_init_key(card, key_enc, key_mac, result, exdata->smtype);
-	LOG_TEST_RET(ctx, r, "gen_init_key failed");
-	if (exdata->bFipsCertification) {
-		memcpy(ran_key, &result[12+1], 8);
-	} else {
-		memcpy(ran_key, &result[12], 8);
+	if (r == SC_SUCCESS) {
+		if (exdata->bFipsCertification) {
+			memcpy(ran_key, &result[12+1], 8);
+		} else {
+			memcpy(ran_key, &result[12], 8);
+		}
+
+		r = verify_init_key(card, ran_key, exdata->smtype);
 	}
 
-	r = verify_init_key(card, ran_key, exdata->smtype);
-	LOG_TEST_RET(ctx, r, "verify_init_key failed");
+	exdata->in_mutual_auth = 0;
+	LOG_TEST_RET(ctx, r, "mutual authentication failed");
 
 	LOG_FUNC_RETURN(ctx, r);
 }
@@ -1517,6 +1561,21 @@ epass2003_sm_unwrap_apdu(struct sc_card *card, struct sc_apdu *sm, struct sc_apd
 	exdata = (epass2003_exdata *)card->drv_data;
 
 	LOG_FUNC_CALLED(card->ctx);
+
+	/* The card answers some errors in plain, with neither data nor MAC: 6987/6988
+	 * when it cannot verify the secure messaging of the command (e.g. the session
+	 * keys were renewed by another process), or 6A80 when reading past the last
+	 * record. Pass such status words through instead of reporting a MAC failure,
+	 * which would also make sc_sm_single_transmit() stop secure messaging. They
+	 * carry no data and cannot report success: a plain 9000 or 61XX still needs a
+	 * valid MAC. */
+	if (exdata->sm && sm->resplen == 0 && sm->sw1 != 0x90 && sm->sw1 != 0x61) {
+		sc_log(card->ctx, "Plain status word without MAC: %02X%02X", sm->sw1, sm->sw2);
+		plain->resplen = 0;
+		plain->sw1 = sm->sw1;
+		plain->sw2 = sm->sw2;
+		LOG_FUNC_RETURN(card->ctx, SC_SUCCESS);
+	}
 
 	/* verify MAC, and check if SW1,2 match SW1,2 encapsulated in SM */
 	if (exdata->sm) {
@@ -3121,20 +3180,27 @@ get_external_key_retries(struct sc_card *card, unsigned char kid, unsigned char 
 static int
 epass2003_get_challenge(sc_card_t *card, u8 *rnd, size_t len)
 {
+	struct sc_apdu apdu;
 	u8 rbuf[16];
 	size_t out_len;
 	int r;
 
 	LOG_FUNC_CALLED(card->ctx);
 
-	r = iso_ops->get_challenge(card, rbuf, sizeof rbuf);
+	/* Same APDU as iso7816_get_challenge(), but sent through sc_transmit_apdu_t():
+	 * GET CHALLENGE starts every PIN verification, so it is often the first APDU
+	 * after another process re-established secure messaging. */
+	sc_format_apdu(card, &apdu, SC_APDU_CASE_2, 0x84, 0x00, 0x00);
+	apdu.le = sizeof rbuf;
+	apdu.resp = rbuf;
+	apdu.resplen = sizeof rbuf;
+
+	r = sc_transmit_apdu_t(card, &apdu);
+	LOG_TEST_RET(card->ctx, r, "APDU transmit failed");
+	r = sc_check_sw(card, apdu.sw1, apdu.sw2);
 	LOG_TEST_RET(card->ctx, r, "GET CHALLENGE cmd failed");
 
-	if (len < (size_t) r) {
-		out_len = len;
-	} else {
-		out_len = (size_t) r;
-	}
+	out_len = len < apdu.resplen ? len : apdu.resplen;
 	memcpy(rnd, rbuf, out_len);
 
 	LOG_FUNC_RETURN(card->ctx, (int) out_len);
