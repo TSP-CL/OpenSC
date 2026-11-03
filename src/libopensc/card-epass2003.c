@@ -933,13 +933,46 @@ epass2003_refresh(struct sc_card *card)
 	exdata = (epass2003_exdata *)card->drv_data;
 
 	if (exdata->sm) {
+		/* sm_mode 0 also keeps epass2003_card_reader_lock_obtained() from
+		 * re-entering. Hold the reader lock so that no other process can
+		 * establish its own session in the middle of the handshake. */
 		card->sm_ctx.sm_mode = 0;
-		r = mutual_auth(card, g_init_key_enc, g_init_key_mac);
+		r = sc_lock(card);
+		if (r == SC_SUCCESS) {
+			r = mutual_auth(card, g_init_key_enc, g_init_key_mac);
+			sc_unlock(card);
+		}
 		card->sm_ctx.sm_mode = SM_MODE_TRANSMIT;
 		LOG_TEST_RET(card->ctx, r, "mutual_auth failed");
 	}
 
 	return r;
+}
+
+/*
+ * The secure messaging session belongs to the process that established it, but every
+ * process that opens the token (epass2003_init()) or logs out (epass2003_logout())
+ * establishes a new one, which invalidates the session keys of the others. On Windows
+ * this happens on every signature through the minidriver: the PIN dialog
+ * (CredentialUIBroker.exe) verifies the PIN and logs out before the application signs.
+ * Re-establish secure messaging whenever this process obtains the reader lock, so that
+ * every transaction starts with valid session keys. After a reset, sc_lock() has
+ * already called sm_ctx.ops.open().
+ */
+static int
+epass2003_card_reader_lock_obtained(struct sc_card *card, int was_reset)
+{
+	epass2003_exdata *exdata = (epass2003_exdata *)card->drv_data;
+	int r = SC_SUCCESS;
+
+	LOG_FUNC_CALLED(card->ctx);
+
+	/* Not before epass2003_init() has set up secure messaging, nor while it is being
+	 * (re-)established */
+	if (was_reset == 0 && exdata && exdata->sm && card->sm_ctx.sm_mode == SM_MODE_TRANSMIT)
+		r = epass2003_refresh(card);
+
+	LOG_FUNC_RETURN(card->ctx, r);
 }
 
 
@@ -3315,6 +3348,7 @@ static struct sc_card_driver *sc_get_driver(void)
 	epass2003_ops.check_sw = epass2003_check_sw;
 	epass2003_ops.get_challenge = epass2003_get_challenge;
 	epass2003_ops.logout = epass2003_logout;
+	epass2003_ops.card_reader_lock_obtained = epass2003_card_reader_lock_obtained;
 	return &epass2003_drv;
 }
 
