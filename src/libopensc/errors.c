@@ -138,7 +138,8 @@ const char *sc_strerror(int error)
 		"IFD data missing",
 		"SM not applied",
 		"SM session already active",
-		"Invalid checksum"
+		"Invalid checksum",
+		"SM Incorrect SM Data Objects"
 	};
 	const unsigned int sm_base = -SC_ERROR_SM;
 
